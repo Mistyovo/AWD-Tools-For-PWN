@@ -422,18 +422,18 @@ def make_seccomp_stub_x86_64(
 	生成 seccomp 初始化 stub（strict 或 blacklist）。
 
 	strict:
-	  seccomp(SECCOMP_SET_MODE_STRICT, 0, NULL)
+	  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+	  prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_STRICT, 0)
 
 	blacklist:
-	  seccomp(SECCOMP_SET_MODE_FILTER, 0, &sock_fprog)
+	  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+	  prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER, &sock_fprog)
 	  其中 sock_fprog/filter 内联到 stub 末尾
 	"""
 
-	# 保存/恢复关键寄存器，避免 PIE e_entry hook 破坏启动现场（尤其 rdx/rcx/r11）。
-	# push: rax, rdi, rsi, rdx, rcx, r11, r10, r8
-	SAVE_REGS = b"\x50\x57\x56\x52\x51\x41\x53\x41\x52\x41\x50"
-	# pop: r8, r10, r11, rcx, rdx, rsi, rdi, rax
-	RESTORE_REGS = b"\x41\x58\x41\x5A\x41\x5B\x59\x5A\x5E\x5F\x58"
+	# AWD 场景优先最小改动：仅保护 _start 关键传参寄存器 rdx。
+	SAVE_RDX = b"\x52"
+	RESTORE_RDX = b"\x5A"
 
 	# prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 	PRCTL_NO_NEW_PRIVS = (
@@ -446,28 +446,25 @@ def make_seccomp_stub_x86_64(
 		+ b"\x0F\x05"
 	)
 
+	# prctl(PR_SET_SECCOMP, mode, arg3)
+	def prctl_set_seccomp(mode: int, arg3_bytes: bytes) -> bytes:
+		if len(arg3_bytes) != 3:
+			raise PatchError("内部错误：arg3_bytes 长度必须为 3")
+		return (
+			b"\xB8" + struct.pack("<I", SYS_PRCTL_X86_64)
+			+ b"\xBF" + struct.pack("<I", PR_SET_SECCOMP)
+			+ b"\xBE" + struct.pack("<I", mode)
+			+ arg3_bytes
+			+ b"\x0F\x05"
+		)
+
 	if config.mode == "strict":
 		code = bytearray()
-		code += SAVE_REGS
+		code += SAVE_RDX
 		code += PRCTL_NO_NEW_PRIVS
-
-		# 先走 seccomp syscall，失败时回退到 prctl(PR_SET_SECCOMP, STRICT)
-		code += b"\xB8" + struct.pack("<I", SYS_SECCOMP_X86_64)
-		code += b"\xBF" + struct.pack("<I", SECCOMP_SET_MODE_STRICT)
-		code += b"\x31\xF6"
-		code += b"\x31\xD2"
-		code += b"\x0F\x05"
-		code += b"\x85\xC0"            # test eax, eax
-		code += b"\x79\x19"            # jns +25
-		code += b"\xB8" + struct.pack("<I", SYS_PRCTL_X86_64)
-		code += b"\xBF" + struct.pack("<I", PR_SET_SECCOMP)
-		code += b"\xBE" + struct.pack("<I", SECCOMP_SET_MODE_STRICT)
-		code += b"\x31\xD2"
-		code += b"\x45\x31\xD2"
-		code += b"\x45\x31\xC0"
-		code += b"\x0F\x05"
-
-		code += RESTORE_REGS
+		# arg3 = NULL -> xor edx, edx
+		code += prctl_set_seccomp(SECCOMP_SET_MODE_STRICT, b"\x31\xD2")
+		code += RESTORE_RDX
 		code += make_jump_back_rel32(inject_vaddr, len(code), target_vaddr)
 		return bytes(code)
 
@@ -475,41 +472,26 @@ def make_seccomp_stub_x86_64(
 	insn_count = len(filter_blob) // 8
 
 	code = bytearray()
-	code += SAVE_REGS
+	code += SAVE_RDX
 	code += PRCTL_NO_NEW_PRIVS
-
-	# lea r10, [rip + disp32_to_filter]
-	lea_off = len(code)
-	code += b"\x4C\x8D\x15\x00\x00\x00\x00"
 
 	# sub rsp, 0x10
 	code += b"\x48\x83\xEC\x10"
 	# mov word ptr [rsp], insn_count
 	code += b"\x66\xC7\x04\x24" + struct.pack("<H", insn_count)
-	# mov [rsp+8], r10
-	code += b"\x4C\x89\x54\x24\x08"
 
-	# seccomp(SECCOMP_SET_MODE_FILTER, 0, rsp)
-	code += b"\xB8" + struct.pack("<I", SYS_SECCOMP_X86_64)
-	code += b"\xBF" + struct.pack("<I", SECCOMP_SET_MODE_FILTER)
-	code += b"\x31\xF6"
-	code += b"\x48\x89\xE2"
-	code += b"\x0F\x05"
-	code += b"\x85\xC0"               # test eax, eax
-	code += b"\x79\x1A"               # jns +26
+	# lea rax, [rip + disp32_to_filter]
+	lea_filter_off = len(code)
+	code += b"\x48\x8D\x05\x00\x00\x00\x00"
+	# mov [rsp+8], rax
+	code += b"\x48\x89\x44\x24\x08"
 
-	# fallback: prctl(PR_SET_SECCOMP, FILTER, rsp)
-	code += b"\xB8" + struct.pack("<I", SYS_PRCTL_X86_64)
-	code += b"\xBF" + struct.pack("<I", PR_SET_SECCOMP)
-	code += b"\xBE" + struct.pack("<I", SECCOMP_SET_MODE_FILTER)
-	code += b"\x48\x89\xE2"
-	code += b"\x45\x31\xD2"
-	code += b"\x45\x31\xC0"
-	code += b"\x0F\x05"
+	# arg3 = rsp -> mov rdx, rsp
+	code += prctl_set_seccomp(SECCOMP_SET_MODE_FILTER, b"\x48\x89\xE2")
 
 	# add rsp, 0x10
 	code += b"\x48\x83\xC4\x10"
-	code += RESTORE_REGS
+	code += RESTORE_RDX
 
 	# 跳回原执行流
 	code += make_jump_back_rel32(inject_vaddr, len(code), target_vaddr)
@@ -519,12 +501,12 @@ def make_seccomp_stub_x86_64(
 	code += filter_blob
 
 	# 回填 lea disp32
-	rip_after_lea = inject_vaddr + lea_off + 7
+	rip_after_lea = inject_vaddr + lea_filter_off + 7
 	filter_addr = inject_vaddr + filter_off
 	disp = filter_addr - rip_after_lea
 	if disp < -0x80000000 or disp > 0x7FFFFFFF:
 		raise PatchError("过滤器地址位移超出 rel32 范围")
-	struct.pack_into("<i", code, lea_off + 3, disp)
+	struct.pack_into("<i", code, lea_filter_off + 3, disp)
 
 	return bytes(code)
 
